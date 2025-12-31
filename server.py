@@ -23,7 +23,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Track connected users: {api_key: sid}
+# Track connected users: {api_key: {'sid': sid, 'last_seen': timestamp, 'type': 'websocket'|'http'}}
 connected_users = {}
 
 
@@ -31,7 +31,7 @@ def init_db():
     """Initialize the database with required tables"""
     conn = sqlite3.connect('filetransfer.db')
     c = conn.cursor()
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +42,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS friends (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,7 +54,7 @@ def init_db():
             UNIQUE(user_id, friend_user_id)
         )
     ''')
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +71,7 @@ def init_db():
             FOREIGN KEY (receiver_id) REFERENCES users(id)
         )
     ''')
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +84,42 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ''')
-    
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER NOT NULL,
+            receiver_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            read BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (sender_id) REFERENCES users(id),
+            FOREIGN KEY (receiver_id) REFERENCES users(id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation
+            ON messages(sender_id, receiver_id, created_at DESC)
+    ''')
+
+    c.execute('''
+        CREATE INDEX IF NOT EXISTS idx_messages_receiver
+            ON messages(receiver_id, read, created_at DESC)
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS conversation_reads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            friend_id INTEGER NOT NULL,
+            last_read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (friend_id) REFERENCES users(id),
+            UNIQUE(user_id, friend_id)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -149,7 +184,7 @@ def send_notification(user_id, notif_type, message, data=None):
     """Send real-time notification to a user"""
     conn = get_db()
     c = conn.cursor()
-    
+
     # Store notification in database
     c.execute('''
         INSERT INTO notifications (user_id, type, message, data)
@@ -158,17 +193,20 @@ def send_notification(user_id, notif_type, message, data=None):
     conn.commit()
     notif_id = c.lastrowid
     conn.close()
-    
+
     # Get user's API key to find their socket room
     api_key = get_user_api_key_by_id(user_id)
     if api_key and api_key in connected_users:
-        socketio.emit('notification', {
-            'id': notif_id,
-            'type': notif_type,
-            'message': message,
-            'data': data,
-            'timestamp': datetime.now().isoformat()
-        }, room=connected_users[api_key])
+        user_info = connected_users[api_key]
+        # Only send via Socket.IO if it's a websocket connection
+        if isinstance(user_info, dict) and user_info.get('type') == 'websocket':
+            socketio.emit('notification', {
+                'id': notif_id,
+                'type': notif_type,
+                'message': message,
+                'data': data,
+                'timestamp': datetime.now().isoformat()
+            }, room=user_info['sid'])
 
 
 def require_auth(f):
@@ -178,11 +216,11 @@ def require_auth(f):
         api_key = request.headers.get('X-API-Key')
         if not api_key:
             return jsonify({'error': 'API key required'}), 401
-        
+
         user = get_user_by_api_key(api_key)
         if not user:
             return jsonify({'error': 'Invalid API key'}), 401
-        
+
         request.user = user
         return f(*args, **kwargs)
     return decorated
@@ -200,30 +238,34 @@ def handle_authenticate(data):
     """Handle client authentication via WebSocket"""
     api_key = data.get('api_key')
     user = get_user_by_api_key(api_key)
-    
+
     if user:
-        connected_users[api_key] = request.sid
+        connected_users[api_key] = {
+            'sid': request.sid,
+            'last_seen': datetime.now(),
+            'type': 'websocket'
+        }
         join_room(request.sid)
         emit('authenticated', {
             'status': 'success',
             'username': user['username'],
             'friend_code': user['friend_code']
         })
-        print(f"User {user['username']} authenticated")
-        
+        print(f"User {user['username']} authenticated via WebSocket")
+
         # Send pending notifications
         conn = get_db()
         c = conn.cursor()
         c.execute('''
-            SELECT id, type, message, data, created_at 
-            FROM notifications 
+            SELECT id, type, message, data, created_at
+            FROM notifications
             WHERE user_id = ? AND read = FALSE
             ORDER BY created_at DESC
             LIMIT 50
         ''', (user['id'],))
         notifications = c.fetchall()
         conn.close()
-        
+
         for notif in notifications:
             emit('notification', {
                 'id': notif[0],
@@ -239,8 +281,8 @@ def handle_authenticate(data):
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handle client disconnection"""
-    for api_key, sid in list(connected_users.items()):
-        if sid == request.sid:
+    for api_key, info in list(connected_users.items()):
+        if isinstance(info, dict) and info.get('sid') == request.sid:
             del connected_users[api_key]
             break
     print(f"Client disconnected: {request.sid}")
@@ -259,30 +301,36 @@ def handle_mark_read(data):
 
 
 # REST Routes
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint for deployment platforms"""
+    return jsonify({'status': 'ok', 'service': 'file-transfer-api'}), 200
+
+
 @app.route('/register', methods=['POST'])
 def register():
     """Register a new user"""
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    
+
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
-    
+
     friend_code = generate_friend_code()
     api_key = generate_api_key()
     password_hash = hash_password(password)
-    
+
     conn = get_db()
     c = conn.cursor()
-    
+
     try:
         c.execute('''
             INSERT INTO users (username, password_hash, friend_code, api_key)
             VALUES (?, ?, ?, ?)
         ''', (username, password_hash, friend_code, api_key))
         conn.commit()
-        
+
         return jsonify({
             'message': 'Registration successful',
             'friend_code': friend_code,
@@ -300,16 +348,16 @@ def login():
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    
+
     conn = get_db()
     c = conn.cursor()
     c.execute('SELECT password_hash, api_key, friend_code FROM users WHERE username = ?', (username,))
     user = c.fetchone()
     conn.close()
-    
+
     if not user or not verify_password(password, user[0]):
         return jsonify({'error': 'Invalid credentials'}), 401
-    
+
     return jsonify({
         'api_key': user[1],
         'friend_code': user[2]
@@ -322,31 +370,31 @@ def add_friend():
     """Add a friend by friend code"""
     data = request.json
     friend_code = data.get('friend_code')
-    
+
     if not friend_code:
         return jsonify({'error': 'Friend code required'}), 400
-    
+
     conn = get_db()
     c = conn.cursor()
-    
+
     c.execute('SELECT id, username FROM users WHERE friend_code = ?', (friend_code,))
     friend = c.fetchone()
-    
+
     if not friend:
         conn.close()
         return jsonify({'error': 'Friend code not found'}), 404
-    
+
     if friend[0] == request.user['id']:
         conn.close()
         return jsonify({'error': 'Cannot add yourself as a friend'}), 400
-    
+
     try:
         c.execute('INSERT INTO friends (user_id, friend_user_id) VALUES (?, ?)',
                   (request.user['id'], friend[0]))
         c.execute('INSERT INTO friends (user_id, friend_user_id) VALUES (?, ?)',
                   (friend[0], request.user['id']))
         conn.commit()
-        
+
         # Send notification to the friend
         send_notification(
             friend[0],
@@ -354,7 +402,7 @@ def add_friend():
             f"{request.user['username']} added you as a friend!",
             {'username': request.user['username'], 'friend_code': request.user['friend_code']}
         )
-        
+
         return jsonify({
             'message': f'Added {friend[1]} as a friend',
             'friend_username': friend[1]
@@ -365,6 +413,24 @@ def add_friend():
         conn.close()
 
 
+def is_user_online(api_key):
+    """Check if user is online (via WebSocket or recent HTTP heartbeat)"""
+    if not api_key or api_key not in connected_users:
+        return False
+
+    user_info = connected_users[api_key]
+    if isinstance(user_info, dict):
+        # Check if last seen was within 60 seconds
+        last_seen = user_info.get('last_seen', datetime.min)
+        if (datetime.now() - last_seen).total_seconds() < 60:
+            return True
+        else:
+            # Clean up stale connection
+            del connected_users[api_key]
+            return False
+    return False
+
+
 @app.route('/friends', methods=['GET'])
 @require_auth
 def list_friends():
@@ -372,25 +438,25 @@ def list_friends():
     conn = get_db()
     c = conn.cursor()
     c.execute('''
-        SELECT u.id, u.username, u.friend_code 
+        SELECT u.id, u.username, u.friend_code
         FROM friends f
         JOIN users u ON f.friend_user_id = u.id
         WHERE f.user_id = ?
     ''', (request.user['id'],))
     friends = c.fetchall()
     conn.close()
-    
+
     # Check online status
     friend_list = []
     for f in friends:
         api_key = get_user_api_key_by_id(f[0])
-        online = api_key in connected_users if api_key else False
+        online = is_user_online(api_key)
         friend_list.append({
             'username': f[1],
             'friend_code': f[2],
             'online': online
         })
-    
+
     return jsonify({'friends': friend_list})
 
 
@@ -400,46 +466,46 @@ def upload_file():
     """Upload a file to send to a friend"""
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
-    
+
     file = request.files['file']
     recipient_code = request.form.get('recipient_code')
-    
+
     if not recipient_code:
         return jsonify({'error': 'Recipient friend code required'}), 400
-    
+
     conn = get_db()
     c = conn.cursor()
-    
+
     c.execute('SELECT id, username FROM users WHERE friend_code = ?', (recipient_code,))
     recipient = c.fetchone()
-    
+
     if not recipient:
         conn.close()
         return jsonify({'error': 'Recipient not found'}), 404
-    
+
     c.execute('''
-        SELECT 1 FROM friends 
+        SELECT 1 FROM friends
         WHERE user_id = ? AND friend_user_id = ?
     ''', (request.user['id'], recipient[0]))
-    
+
     if not c.fetchone():
         conn.close()
         return jsonify({'error': 'Recipient is not in your friend list'}), 403
-    
+
     file_id = str(uuid.uuid4())
     filename = file.filename
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
     file.save(file_path)
     file_size = os.path.getsize(file_path)
     expires_at = datetime.now() + timedelta(days=7)
-    
+
     c.execute('''
         INSERT INTO files (file_id, filename, sender_id, receiver_id, file_path, file_size, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     ''', (file_id, filename, request.user['id'], recipient[0], file_path, file_size, expires_at))
     conn.commit()
     conn.close()
-    
+
     # Send real-time notification to recipient
     send_notification(
         recipient[0],
@@ -453,7 +519,7 @@ def upload_file():
             'sender_code': request.user['friend_code']
         }
     )
-    
+
     return jsonify({
         'message': 'File uploaded successfully',
         'file_id': file_id,
@@ -477,7 +543,7 @@ def inbox():
     ''', (request.user['id'], datetime.now()))
     files = c.fetchall()
     conn.close()
-    
+
     return jsonify({
         'files': [{
             'file_id': f[0],
@@ -506,7 +572,7 @@ def sent_files():
     ''', (request.user['id'],))
     files = c.fetchall()
     conn.close()
-    
+
     return jsonify({
         'files': [{
             'file_id': f[0],
@@ -527,19 +593,19 @@ def download_file(file_id):
     conn = get_db()
     c = conn.cursor()
     c.execute('''
-        SELECT file_path, filename, sender_id FROM files 
+        SELECT file_path, filename, sender_id FROM files
         WHERE file_id = ? AND receiver_id = ? AND expires_at > ?
     ''', (file_id, request.user['id'], datetime.now()))
     file_info = c.fetchone()
-    
+
     if not file_info:
         conn.close()
         return jsonify({'error': 'File not found or expired'}), 404
-    
+
     c.execute('UPDATE files SET downloaded = TRUE WHERE file_id = ?', (file_id,))
     conn.commit()
     conn.close()
-    
+
     # Notify sender that file was downloaded
     send_notification(
         file_info[2],
@@ -551,7 +617,7 @@ def download_file(file_id):
             'downloaded_by': request.user['username']
         }
     )
-    
+
     return send_file(file_info[0], download_name=file_info[1], as_attachment=True)
 
 
@@ -570,7 +636,7 @@ def get_notifications():
     ''', (request.user['id'],))
     notifications = c.fetchall()
     conn.close()
-    
+
     return jsonify({
         'notifications': [{
             'id': n[0],
@@ -580,6 +646,266 @@ def get_notifications():
             'read': bool(n[4]),
             'timestamp': n[5]
         } for n in notifications]
+    })
+
+
+@app.route('/heartbeat', methods=['POST'])
+@require_auth
+def heartbeat():
+    """Keep user marked as online via HTTP polling (for clients without WebSocket)"""
+    api_key = request.headers.get('X-API-Key')
+
+    if api_key:
+        connected_users[api_key] = {
+            'sid': None,
+            'last_seen': datetime.now(),
+            'type': 'http'
+        }
+        print(f"Heartbeat from {request.user['username']} (HTTP client)")
+
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/messages/send', methods=['POST'])
+@require_auth
+def send_message():
+    """Send a message to a friend"""
+    data = request.json
+    recipient_code = data.get('recipient_code')
+    message = data.get('message', '').strip()
+
+    if not recipient_code or not message:
+        return jsonify({'error': 'Recipient code and message required'}), 400
+
+    if len(message) > 2000:
+        return jsonify({'error': 'Message too long (max 2000 characters)'}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get recipient
+    c.execute('SELECT id, username FROM users WHERE friend_code = ?', (recipient_code,))
+    recipient = c.fetchone()
+
+    if not recipient:
+        conn.close()
+        return jsonify({'error': 'Recipient not found'}), 404
+
+    # Verify friendship
+    c.execute('''
+        SELECT 1 FROM friends
+        WHERE user_id = ? AND friend_user_id = ?
+    ''', (request.user['id'], recipient[0]))
+
+    if not c.fetchone():
+        conn.close()
+        return jsonify({'error': 'Recipient is not in your friend list'}), 403
+
+    # Insert message
+    c.execute('''
+        INSERT INTO messages (sender_id, receiver_id, message)
+        VALUES (?, ?, ?)
+    ''', (request.user['id'], recipient[0], message))
+    conn.commit()
+    message_id = c.lastrowid
+
+    # Get timestamp
+    c.execute('SELECT created_at FROM messages WHERE id = ?', (message_id,))
+    timestamp = c.fetchone()[0]
+    conn.close()
+
+    # Send notification
+    send_notification(
+        recipient[0],
+        'message_received',
+        f"{request.user['username']}: {message[:50]}{'...' if len(message) > 50 else ''}",
+        {
+            'message_id': message_id,
+            'sender': request.user['username'],
+            'sender_code': request.user['friend_code']
+        }
+    )
+
+    return jsonify({
+        'message': 'Message sent',
+        'message_id': message_id,
+        'timestamp': timestamp
+    })
+
+
+@app.route('/messages/conversation/<friend_code>', methods=['GET'])
+@require_auth
+def get_conversation(friend_code):
+    """Get messages in a conversation with a friend"""
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get friend info
+    c.execute('SELECT id, username FROM users WHERE friend_code = ?', (friend_code,))
+    friend = c.fetchone()
+
+    if not friend:
+        conn.close()
+        return jsonify({'error': 'Friend not found'}), 404
+
+    # Verify friendship
+    c.execute('''
+        SELECT 1 FROM friends
+        WHERE user_id = ? AND friend_user_id = ?
+    ''', (request.user['id'], friend[0]))
+
+    if not c.fetchone():
+        conn.close()
+        return jsonify({'error': 'Not friends with this user'}), 403
+
+    # Get messages
+    c.execute('''
+        SELECT m.id, m.sender_id, u1.username, m.receiver_id, u2.username, m.message, m.created_at
+        FROM messages m
+        JOIN users u1 ON m.sender_id = u1.id
+        JOIN users u2 ON m.receiver_id = u2.id
+        WHERE (m.sender_id = ? AND m.receiver_id = ?)
+           OR (m.sender_id = ? AND m.receiver_id = ?)
+        ORDER BY m.created_at ASC
+        LIMIT 100
+    ''', (request.user['id'], friend[0], friend[0], request.user['id']))
+
+    messages = c.fetchall()
+
+    # Mark messages as read
+    c.execute('''
+        UPDATE messages SET read = TRUE
+        WHERE receiver_id = ? AND sender_id = ? AND read = FALSE
+    ''', (request.user['id'], friend[0]))
+
+    # Update conversation_reads
+    c.execute('''
+        INSERT OR REPLACE INTO conversation_reads (user_id, friend_id, last_read_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+    ''', (request.user['id'], friend[0]))
+
+    conn.commit()
+    conn.close()
+
+    # Get friend online status
+    friend_api_key = get_user_api_key_by_id(friend[0])
+    online = is_user_online(friend_api_key)
+
+    return jsonify({
+        'messages': [{
+            'id': m[0],
+            'sender_id': m[1],
+            'sender_username': m[2],
+            'receiver_id': m[3],
+            'receiver_username': m[4],
+            'message': m[5],
+            'timestamp': m[6],
+            'is_mine': m[1] == request.user['id']
+        } for m in messages],
+        'friend': {
+            'username': friend[1],
+            'friend_code': friend_code,
+            'online': online
+        }
+    })
+
+
+@app.route('/messages/conversations', methods=['GET'])
+@require_auth
+def get_conversations():
+    """List all conversations with unread counts"""
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get friends
+    c.execute('''
+        SELECT u.id, u.username, u.friend_code
+        FROM friends f
+        JOIN users u ON f.friend_user_id = u.id
+        WHERE f.user_id = ?
+    ''', (request.user['id'],))
+    friends = c.fetchall()
+
+    conversations = []
+    for friend in friends:
+        friend_id, friend_username, friend_code = friend
+
+        # Get last message in conversation
+        c.execute('''
+            SELECT message, created_at, sender_id
+            FROM messages
+            WHERE (sender_id = ? AND receiver_id = ?)
+               OR (sender_id = ? AND receiver_id = ?)
+            ORDER BY created_at DESC
+            LIMIT 1
+        ''', (request.user['id'], friend_id, friend_id, request.user['id']))
+
+        last_msg = c.fetchone()
+
+        # Count unread messages
+        c.execute('''
+            SELECT COUNT(*) FROM messages
+            WHERE sender_id = ? AND receiver_id = ? AND read = FALSE
+        ''', (friend_id, request.user['id']))
+
+        unread_count = c.fetchone()[0]
+
+        # Get online status
+        friend_api_key = get_user_api_key_by_id(friend_id)
+        online = is_user_online(friend_api_key)
+
+        conversations.append({
+            'friend_username': friend_username,
+            'friend_code': friend_code,
+            'online': online,
+            'last_message': last_msg[0] if last_msg else None,
+            'last_message_timestamp': last_msg[1] if last_msg else None,
+            'unread_count': unread_count
+        })
+
+    conn.close()
+
+    # Sort by last message timestamp
+    conversations.sort(key=lambda x: x['last_message_timestamp'] or '', reverse=True)
+
+    return jsonify({'conversations': conversations})
+
+
+@app.route('/messages/mark_read/<friend_code>', methods=['POST'])
+@require_auth
+def mark_messages_read(friend_code):
+    """Mark all messages from a friend as read"""
+    conn = get_db()
+    c = conn.cursor()
+
+    # Get friend
+    c.execute('SELECT id FROM users WHERE friend_code = ?', (friend_code,))
+    friend = c.fetchone()
+
+    if not friend:
+        conn.close()
+        return jsonify({'error': 'Friend not found'}), 404
+
+    # Mark as read
+    c.execute('''
+        UPDATE messages SET read = TRUE
+        WHERE receiver_id = ? AND sender_id = ? AND read = FALSE
+    ''', (request.user['id'], friend[0]))
+
+    count = c.rowcount
+
+    # Update conversation_reads
+    c.execute('''
+        INSERT OR REPLACE INTO conversation_reads (user_id, friend_id, last_read_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+    ''', (request.user['id'], friend[0]))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        'message': 'Messages marked as read',
+        'count': count
     })
 
 
